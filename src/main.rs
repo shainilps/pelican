@@ -2,6 +2,7 @@ use std::env;
 
 mod mkfs;
 mod mount;
+mod util;
 
 enum Command {
     Mkfs { image: String },
@@ -57,7 +58,14 @@ fn main() {
     };
 
     match command {
-        Command::Mkfs { image } => mkfs::mkfs(&image),
-        Command::Mount { image, mountpoint } => mount::mount(&image, &mountpoint),
+        Command::Mkfs { image } => {
+            if let Err(e) = mkfs::mkfs(&image) {
+                eprintln!("mkfs: {e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Mount { image, mountpoint } => {
+            mount::mount(&image, &mountpoint);
+        }
     }
 }
