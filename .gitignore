@@ -1,1 +1,5 @@
 /target
+tmp
+disc.img
+example.c
+example.rs

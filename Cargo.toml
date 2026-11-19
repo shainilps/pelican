@@ -2,5 +2,8 @@
 name = "pelican"
 version = "0.1.0"
 edition = "2024"
+description = "A Time-Machine File-System in userspace (FUSE)"
 
 [dependencies]
+env_logger = "0.11.11"
+fuser = "0.18.0"
