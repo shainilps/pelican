@@ -2,9 +2,7 @@ use fuser::{Config, Filesystem, MountOption};
 
 struct Pelican;
 
-impl Filesystem for Pelican {
-
-}
+impl Filesystem for Pelican {}
 
 pub fn mount(_image: &str, mountpoint: &str) {
     let mut config = Config::default();

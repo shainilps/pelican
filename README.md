@@ -45,6 +45,7 @@ revision head //it stores the inode
 spare for later rest
 --------------------------------
 
+
 total 256 bytes
 
 - 16 inode per block

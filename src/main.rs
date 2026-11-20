@@ -1,5 +1,6 @@
 use std::env;
 
+mod inode;
 mod mkfs;
 mod mount;
 mod util;

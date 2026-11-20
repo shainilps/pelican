@@ -2,10 +2,11 @@ use std::{
     error::Error,
     fs::OpenOptions,
     io::{self, Seek},
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, MetadataExt},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::util;
+use crate::{inode, util};
 
 const BLOCK_SIZE: u64 = 4096;
 const INODE_SIZE: u64 = 256;
@@ -68,14 +69,47 @@ pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
         inode_table_at: 3,
         data_at: 3 + inode_block_count,
         free_blocks: total_blocks - (3 + inode_block_count),
-        free_inodes: (total_inode - 1),
+        free_inodes: (total_inode - 2),
         root_inode: ROOT_INODE,
     };
 
-    //TODO: we do need to write a root inode in the disc
-    //TODO: mark the blocks, inode bitmap
+    let mut block_bitmap = [0u8; BLOCK_SIZE as usize];
 
+    for n in 0..sb.data_at {
+        block_bitmap[(n / 8) as usize] |= 1 << (n % 8);
+    }
+
+    for n in total_blocks..(BLOCK_SIZE * 8) {
+        block_bitmap[(n / 8) as usize] |= 1 << (n % 8);
+    }
+
+    let mut inode_bitmap = [0u8; BLOCK_SIZE as usize];
+    inode_bitmap[0] = 0b11;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let meta = file.metadata()?;
+
+    let root = inode::INode {
+        kind: 0o040755,
+        uid: meta.uid() as u64,
+        gid: meta.gid() as u64,
+        size: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        d_pointers: [0; 12],
+        i_pointer: 0,
+        revision_head: 0,
+    };
+
+    file.write_all_at(&block_bitmap, sb.block_bitmap_at * BLOCK_SIZE)?;
+    file.write_all_at(&inode_bitmap, sb.inode_bitmap_at * BLOCK_SIZE)?;
+    file.write_all_at(
+        &root.to_bytes(),
+        sb.inode_table_at * BLOCK_SIZE + ROOT_INODE * INODE_SIZE,
+    )?;
     file.write_all_at(&sb.to_bytes(), 0)?;
+
     file.sync_all()?;
     Ok(())
 }
