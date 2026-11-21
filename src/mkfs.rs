@@ -74,6 +74,7 @@ pub fn mkfs(image: &str) -> io::Result<()> {
         dpointers: [0; 12],
         ipointer: 0,
         revision_head: 0,
+        rtime: now,
     };
 
     file.write_all_at(&block_bitmap, sb.block_bitmap_at * BLOCK_SIZE)?;

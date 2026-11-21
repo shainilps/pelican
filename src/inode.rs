@@ -2,6 +2,7 @@ use crate::util;
 
 pub const INODE_SIZE: u64 = 256;
 
+#[derive(Clone)]
 pub struct INode {
     pub kind: u64,
     pub uid: u64,
@@ -14,6 +15,7 @@ pub struct INode {
     pub dpointers: [u64; 12],
     pub ipointer: u64,
     pub revision_head: u64,
+    pub rtime: u64,
     //rest padding
 }
 
@@ -31,6 +33,7 @@ impl INode {
         util::put_u64(&mut buf, 152, self.ipointer);
         util::put_u64(&mut buf, 160, self.revision_head);
         util::put_u64(&mut buf, 168, self.nlink);
+        util::put_u64(&mut buf, 176, self.rtime);
         buf
     }
 
@@ -47,6 +50,7 @@ impl INode {
             ipointer: util::get_u64(buf, 152),
             revision_head: util::get_u64(buf, 160),
             nlink: util::get_u64(buf, 168),
+            rtime: util::get_u64(buf, 176),
         }
     }
 }

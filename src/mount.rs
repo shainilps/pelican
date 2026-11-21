@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     fs::{File, OpenOptions},
     io,
@@ -21,6 +22,8 @@ use crate::{
     inode::{INODE_SIZE, INode},
     superblock::{BLOCK_SIZE, ROOT_INODE, SuperBlock},
 };
+
+const REVISION_INTERVAL: u64 = 3600;
 
 struct Pelican {
     file: File,
@@ -92,6 +95,13 @@ impl Pelican {
         }
 
         let mut pos = offset;
+
+        let shared = if inode.revision_head != 0 {
+            self.read_inode(inode.revision_head)?.dpointers
+        } else {
+            [0; 12]
+        };
+
         while pos < end {
             let index = (pos / BLOCK_SIZE) as usize;
             let in_block = pos % BLOCK_SIZE;
@@ -99,7 +109,10 @@ impl Pelican {
 
             if inode.dpointers[index] == 0 {
                 inode.dpointers[index] = self.alloc_block()?;
+            } else if inode.dpointers[index] == shared[index] {
+                inode.dpointers[index] = self.copy_block(inode.dpointers[index])?;
             }
+
             let block = inode.dpointers[index];
 
             let src = &data[(pos - offset) as usize..(pos - offset + n) as usize];
@@ -172,20 +185,6 @@ impl Pelican {
         Ok(ino)
     }
 
-    fn free_inode(&self, ino: u64) -> io::Result<()> {
-        let mut sb = self.sb.lock().unwrap();
-
-        let mut bitmap = [0u8; BLOCK_SIZE as usize];
-        let bitmap_off = sb.inode_bitmap_at * BLOCK_SIZE;
-        self.file.read_exact_at(&mut bitmap, bitmap_off)?;
-
-        bitmap[(ino / 8) as usize] &= !(1 << (ino % 8));
-        self.file.write_all_at(&bitmap, bitmap_off)?;
-
-        sb.free_inodes += 1;
-        self.write_superblock(&sb)
-    }
-
     fn add_entry(&self, parent_ino: u64, entry: &DirEntry) -> io::Result<()> {
         let mut parent = self.read_inode(parent_ino)?;
         let data = self.read_data(&parent, 0, parent.size)?;
@@ -245,22 +244,30 @@ impl Pelican {
         }
 
         if new_size < inode.size {
+            let shared = if inode.revision_head != 0 {
+                self.read_inode(inode.revision_head)?.dpointers
+            } else {
+                [0; 12]
+            };
+
             let keep = new_size.div_ceil(BLOCK_SIZE) as usize;
-            for slot in inode.dpointers.iter_mut().skip(keep) {
-                if *slot != 0 {
-                    self.free_block(*slot)?;
-                    *slot = 0;
+            for i in keep..inode.dpointers.len() {
+                let block = inode.dpointers[i];
+                if block != 0 && block != shared[i] {
+                    self.free_block(block)?;
                 }
+                inode.dpointers[i] = 0;
             }
 
             let in_block = new_size % BLOCK_SIZE;
-            if in_block != 0 {
-                let block = inode.dpointers[keep - 1];
-                if block != 0 {
-                    let tail = vec![0u8; (BLOCK_SIZE - in_block) as usize];
-                    self.file
-                        .write_all_at(&tail, block * BLOCK_SIZE + in_block)?;
+            if in_block != 0 && inode.dpointers[keep - 1] != 0 {
+                if inode.dpointers[keep - 1] == shared[keep - 1] {
+                    inode.dpointers[keep - 1] = self.copy_block(inode.dpointers[keep - 1])?;
                 }
+                let block = inode.dpointers[keep - 1];
+                let tail = vec![0u8; (BLOCK_SIZE - in_block) as usize];
+                self.file
+                    .write_all_at(&tail, block * BLOCK_SIZE + in_block)?;
             }
         }
 
@@ -268,9 +275,46 @@ impl Pelican {
         Ok(())
     }
 
-    fn destroy_inode(&self, ino: u64, inode: &mut INode) -> io::Result<()> {
-        self.truncate(inode, 0)?;
-        self.free_inode(ino)
+    fn destroy_inode(&self, ino: u64, inode: &INode) -> io::Result<()> {
+        let mut inodes = vec![ino];
+        let mut blocks: HashSet<u64> = inode
+            .dpointers
+            .iter()
+            .copied()
+            .filter(|&b| b != 0)
+            .collect();
+
+        let mut next = inode.revision_head;
+        while next != 0 {
+            let rev = self.read_inode(next)?;
+            blocks.extend(rev.dpointers.iter().copied().filter(|&b| b != 0));
+            inodes.push(next);
+            next = rev.revision_head;
+        }
+
+        let mut sb = self.sb.lock().unwrap();
+
+        let mut bmap = [0u8; BLOCK_SIZE as usize];
+        self.file
+            .read_exact_at(&mut bmap, sb.block_bitmap_at * BLOCK_SIZE)?;
+        for &b in &blocks {
+            bmap[(b / 8) as usize] &= !(1 << (b % 8));
+        }
+        self.file
+            .write_all_at(&bmap, sb.block_bitmap_at * BLOCK_SIZE)?;
+
+        let mut imap = [0u8; BLOCK_SIZE as usize];
+        self.file
+            .read_exact_at(&mut imap, sb.inode_bitmap_at * BLOCK_SIZE)?;
+        for &i in &inodes {
+            imap[(i / 8) as usize] &= !(1 << (i % 8));
+        }
+        self.file
+            .write_all_at(&imap, sb.inode_bitmap_at * BLOCK_SIZE)?;
+
+        sb.free_blocks += blocks.len() as u64;
+        sb.free_inodes += inodes.len() as u64;
+        self.write_superblock(&sb)
     }
 
     fn find_entry(&self, dir: u64, name: &[u8]) -> io::Result<Option<DirEntry>> {
@@ -297,6 +341,26 @@ impl Pelican {
         let mut inode = self.read_inode(ino)?;
         inode.nlink = (inode.nlink as i64 + delta) as u64;
         self.write_inode(ino, &inode)
+    }
+
+    fn snapshot(&self, inode: &mut INode, now: u64) -> io::Result<()> {
+        let snap_ino = self.alloc_inode()?;
+
+        let mut snap = inode.clone();
+        snap.nlink = 0;
+        self.write_inode(snap_ino, &snap)?;
+
+        inode.revision_head = snap_ino;
+        inode.rtime = now;
+        Ok(())
+    }
+
+    fn copy_block(&self, old: u64) -> io::Result<u64> {
+        let new = self.alloc_block()?;
+        let mut buf = [0u8; BLOCK_SIZE as usize];
+        self.file.read_exact_at(&mut buf, old * BLOCK_SIZE)?;
+        self.file.write_all_at(&buf, new * BLOCK_SIZE)?;
+        Ok(new)
     }
 }
 
@@ -418,6 +482,14 @@ impl Filesystem for Pelican {
     ) {
         let ino = u64::from(ino);
         let result = self.read_inode(ino).and_then(|mut inode| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if now.saturating_sub(inode.rtime) > REVISION_INTERVAL {
+                self.snapshot(&mut inode, now)?;
+            }
+
             let n = self.write_data(&mut inode, offset, data)?;
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -466,6 +538,7 @@ impl Filesystem for Pelican {
                 dpointers: [0; 12],
                 ipointer: 0,
                 revision_head: 0,
+                rtime: now,
             };
             self.write_inode(ino, &inode)?;
 
@@ -532,6 +605,9 @@ impl Filesystem for Pelican {
                 inode.gid = g as u64;
             }
             if let Some(sz) = size {
+                if now.saturating_sub(inode.rtime) > REVISION_INTERVAL {
+                    self.snapshot(&mut inode, now)?;
+                }
                 self.truncate(&mut inode, sz)?;
                 inode.mtime = now;
             }
@@ -584,6 +660,7 @@ impl Filesystem for Pelican {
                 dpointers: [0; 12],
                 ipointer: 0,
                 revision_head: 0,
+                rtime: now,
             };
 
             let dot = DirEntry {
@@ -715,7 +792,6 @@ impl Filesystem for Pelican {
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-
         if newname.len() > MAX_NAME {
             return reply.error(Errno::ENAMETOOLONG);
         }
