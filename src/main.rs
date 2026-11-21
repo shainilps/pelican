@@ -1,8 +1,10 @@
 use std::env;
 
+mod dirent;
 mod inode;
 mod mkfs;
 mod mount;
+mod superblock;
 mod util;
 
 enum Command {
@@ -66,7 +68,10 @@ fn main() {
             }
         }
         Command::Mount { image, mountpoint } => {
-            mount::mount(&image, &mountpoint);
+            if let Err(e) = mount::mount(&image, &mountpoint) {
+                eprintln!("mount: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }

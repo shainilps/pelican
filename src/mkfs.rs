@@ -6,43 +6,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{inode, util};
-
-const BLOCK_SIZE: u64 = 4096;
-const INODE_SIZE: u64 = 256;
-const ROOT_INODE: u64 = 1;
-const MAGIC: &[u8; 8] = b"PELICAN5";
-
-struct SuperBlock {
-    block_size: u64,
-    total_blocks: u64,
-    inode_count: u64,
-    inode_bitmap_at: u64,
-    block_bitmap_at: u64,
-    inode_table_at: u64,
-    data_at: u64,
-    free_blocks: u64,
-    free_inodes: u64,
-    root_inode: u64,
-}
-
-impl SuperBlock {
-    fn to_bytes(&self) -> [u8; 4096] {
-        let mut buf = [0u8; 4096];
-        buf[0..8].copy_from_slice(MAGIC);
-        util::put_u64(&mut buf, 8, self.block_size);
-        util::put_u64(&mut buf, 16, self.total_blocks);
-        util::put_u64(&mut buf, 24, self.inode_count);
-        util::put_u64(&mut buf, 32, self.inode_bitmap_at);
-        util::put_u64(&mut buf, 40, self.block_bitmap_at);
-        util::put_u64(&mut buf, 48, self.inode_table_at);
-        util::put_u64(&mut buf, 56, self.data_at);
-        util::put_u64(&mut buf, 64, self.free_blocks);
-        util::put_u64(&mut buf, 72, self.free_inodes);
-        util::put_u64(&mut buf, 80, self.root_inode);
-        buf
-    }
-}
+use crate::{
+    dirent::DIRENT_SIZE,
+    superblock::{BLOCK_SIZE, ROOT_INODE, SuperBlock},
+};
+use crate::{
+    dirent::DirEntry,
+    inode::{INODE_SIZE, INode},
+};
 
 //max 128mb supported for now
 pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
@@ -60,7 +31,7 @@ pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
     let total_inode: u64 = 1024;
     let inode_block_count = (INODE_SIZE * total_inode) / BLOCK_SIZE;
 
-    let sb = SuperBlock {
+    let mut sb = SuperBlock {
         block_size: BLOCK_SIZE,
         total_blocks: total_blocks,
         inode_count: total_inode,
@@ -89,7 +60,7 @@ pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let meta = file.metadata()?;
 
-    let root = inode::INode {
+    let mut root = INode {
         kind: 0o040755,
         uid: meta.uid() as u64,
         gid: meta.gid() as u64,
@@ -97,10 +68,81 @@ pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
         atime: now,
         mtime: now,
         ctime: now,
-        d_pointers: [0; 12],
-        i_pointer: 0,
+        nlink: 2,
+        dpointers: [0; 12],
+        ipointer: 0,
         revision_head: 0,
     };
+
+    //-------------------------------temp file--------------------------
+
+    let hello_ino: u64 = 2;
+    inode_bitmap[(hello_ino / 8) as usize] |= 1 << (hello_ino % 8);
+    sb.free_inodes -= 1;
+    let content = "hello world";
+    let hello_block_no = sb.data_at + 1;
+    block_bitmap[(hello_block_no / 8) as usize] |= 1 << (hello_block_no % 8);
+    sb.free_blocks -= 1;
+
+    let mut hello_block = [0u8; BLOCK_SIZE as usize];
+    hello_block[..content.len()].copy_from_slice(&content.as_bytes());
+    file.write_all_at(&hello_block, hello_block_no * BLOCK_SIZE)?;
+
+    let hello = INode {
+        kind: 0o100644,
+        uid: meta.uid() as u64,
+        gid: meta.gid() as u64,
+        size: content.len() as u64,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        nlink: 1,
+        dpointers: {
+            let mut p = [0u64; 12];
+            p[0] = hello_block_no;
+            p
+        },
+        ipointer: 0,
+        revision_head: 0,
+    };
+
+    file.write_all_at(
+        &hello.to_bytes(),
+        sb.inode_table_at * BLOCK_SIZE + hello_ino * INODE_SIZE,
+    )?;
+
+    let entries = [
+        DirEntry {
+            inode: ROOT_INODE,
+            kind: 2,
+            name: b".".to_vec(),
+        },
+        DirEntry {
+            inode: ROOT_INODE,
+            kind: 2,
+            name: b"..".to_vec(),
+        },
+        DirEntry {
+            inode: hello_ino,
+            kind: 1,
+            name: b"hello.txt".to_vec(),
+        },
+    ];
+
+    let root_block_no = sb.data_at;
+    root.dpointers[0] = root_block_no;
+    block_bitmap[(root_block_no / 8) as usize] |= 1 << (root_block_no % 8);
+    sb.free_blocks -= 1;
+    root.size = DIRENT_SIZE * 3;
+
+    let mut dir_block = [0u8; BLOCK_SIZE as usize];
+    for (i, e) in entries.iter().enumerate() {
+        let off = i * DIRENT_SIZE as usize;
+        dir_block[off..off + DIRENT_SIZE as usize].copy_from_slice(&e.to_bytes());
+    }
+    file.write_all_at(&dir_block, root_block_no * BLOCK_SIZE)?;
+
+    //-------------------------------temp file--------------------------
 
     file.write_all_at(&block_bitmap, sb.block_bitmap_at * BLOCK_SIZE)?;
     file.write_all_at(&inode_bitmap, sb.inode_bitmap_at * BLOCK_SIZE)?;
