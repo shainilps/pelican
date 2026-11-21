@@ -68,3 +68,7 @@ A revision is a copy of the inode (same block pointers) linked through `revision
 - files up to 48 KB (12 direct blocks)
 - 54-byte names, 768 entries per directory
 - no symlinks or hard links
+
+## todo
+
+- make it a distributed filesystem
