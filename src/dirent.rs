@@ -1,7 +1,19 @@
+use fuser::Errno;
+
 use crate::util;
 
 pub const DIRENT_SIZE: u64 = 64;
 pub const MAX_NAME: usize = 54;
+
+pub fn check_name(name: &[u8]) -> Result<(), Errno> {
+    if name.len() > MAX_NAME {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    if name.contains(&b'@') {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
 
 pub struct DirEntry {
     pub inode: u64,

@@ -9,7 +9,7 @@ use std::{
 };
 
 use fuser::{
-    Config, Errno,
+    Config, Errno, FileAttr,
     FileType::{self},
     Filesystem, INodeNo, MountOption, RenameFlags,
 };
@@ -18,12 +18,13 @@ mod convert;
 use convert::{errno, to_attr};
 
 use crate::{
-    dirent::{DIRENT_SIZE, DirEntry, MAX_NAME},
+    dirent::{DIRENT_SIZE, DirEntry, check_name},
     inode::{INODE_SIZE, INode},
     superblock::{BLOCK_SIZE, ROOT_INODE, SuperBlock},
 };
 
 const REVISION_INTERVAL: u64 = 3600;
+const LOG_BIT: u64 = 1 << 63;
 
 struct Pelican {
     file: File,
@@ -362,6 +363,58 @@ impl Pelican {
         self.file.write_all_at(&buf, new * BLOCK_SIZE)?;
         Ok(new)
     }
+
+    fn revision_log(&self, file_ino: u64) -> io::Result<Vec<u8>> {
+        let mut out = String::new();
+        let mut next = file_ino;
+        let mut index = 0;
+        while next != 0 {
+            let rev = self.read_inode(next)?;
+            out.push_str(&format!("{index} -> {}\n", rev.mtime));
+            next = rev.revision_head;
+            index += 1
+        }
+
+        Ok(out.into_bytes())
+    }
+
+    fn log_attr(&self, file_ino: u64) -> io::Result<FileAttr> {
+        let inode = self.read_inode(file_ino)?;
+        let text = self.revision_log(file_ino)?;
+
+        let mut attr = to_attr(LOG_BIT | file_ino, &inode);
+        attr.kind = FileType::RegularFile;
+        attr.size = text.len() as u64;
+        attr.perm = 0o444;
+        attr.nlink = 1;
+        Ok(attr)
+    }
+
+    fn lookup_version(&self, parent: u64, base: &[u8], suffix: &[u8]) -> Result<FileAttr, Errno> {
+        let file = self.find_entry(parent, base)?.ok_or(Errno::ENOENT)?;
+        if file.kind == 2 {
+            return Err(Errno::ENOENT);
+        }
+
+        if suffix == b"log" {
+            return Ok(self.log_attr(file.inode)?);
+        }
+
+        // N: walk N steps down the revision chain
+        let n: u64 = std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or(Errno::ENOENT)?;
+
+        let mut ino = file.inode;
+        for _ in 0..n {
+            ino = self.read_inode(ino)?.revision_head;
+            if ino == 0 {
+                return Err(Errno::ENOENT); // no such revision
+            }
+        }
+        Ok(to_attr(ino, &self.read_inode(ino)?))
+    }
 }
 
 impl Filesystem for Pelican {
@@ -373,6 +426,14 @@ impl Filesystem for Pelican {
         reply: fuser::ReplyAttr,
     ) {
         let ino = u64::from(ino);
+
+        if ino & LOG_BIT != 0 {
+            return match self.log_attr(ino & !LOG_BIT) {
+                Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+                Err(e) => reply.error(e.into()),
+            };
+        }
+
         match self.read_inode(ino) {
             Ok(inode) => reply.attr(&Duration::from_secs(1), &to_attr(ino, &inode)),
             Err(_) => reply.error(fuser::Errno::EIO),
@@ -386,6 +447,15 @@ impl Filesystem for Pelican {
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        let name = name.as_bytes();
+        if let Some(at) = name.iter().rposition(|&b| b == b'@') {
+            let (base, suffix) = (&name[..at], &name[at + 1..]);
+            return match self.lookup_version(u64::from(parent), base, suffix) {
+                Ok(attr) => reply.entry(&Duration::from_secs(1), &attr, fuser::Generation(0)),
+                Err(e) => reply.error(e),
+            };
+        }
+
         let entries = match self
             .read_inode(u64::from(parent))
             .and_then(|inode| self.read_dir(&inode))
@@ -397,7 +467,7 @@ impl Filesystem for Pelican {
             }
         };
 
-        let Some(entry) = entries.iter().find(|e| e.name == name.as_bytes()) else {
+        let Some(entry) = entries.iter().find(|e| e.name == name) else {
             reply.error(fuser::Errno::ENOENT);
             return;
         };
@@ -458,8 +528,21 @@ impl Filesystem for Pelican {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        let ino = u64::from(ino);
+
+        if ino & LOG_BIT != 0 {
+            return match self.revision_log(ino & !LOG_BIT) {
+                Ok(text) => {
+                    let start = (offset as usize).min(text.len());
+                    let end = (start + size as usize).min(text.len());
+                    reply.data(&text[start..end])
+                }
+                Err(e) => reply.error(e.into()),
+            };
+        }
+
         let result = self
-            .read_inode(u64::from(ino))
+            .read_inode(ino)
             .and_then(|inode| self.read_data(&inode, offset, size as u64));
 
         match result {
@@ -481,7 +564,13 @@ impl Filesystem for Pelican {
         reply: fuser::ReplyWrite,
     ) {
         let ino = u64::from(ino);
+        if ino & LOG_BIT != 0 {
+            return reply.error(Errno::EROFS);
+        }
         let result = self.read_inode(ino).and_then(|mut inode| {
+            if inode.nlink == 0 {
+                return Err(io::Error::from_raw_os_error(Errno::EROFS.code()));
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -517,8 +606,8 @@ impl Filesystem for Pelican {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        if name.len() > MAX_NAME {
-            return reply.error(Errno::ENAMETOOLONG);
+        if let Err(e) = check_name(name.as_bytes()) {
+            return reply.error(e);
         }
 
         let result = self.alloc_inode().and_then(|ino| {
@@ -582,7 +671,13 @@ impl Filesystem for Pelican {
         reply: fuser::ReplyAttr,
     ) {
         let ino = u64::from(ino);
+        if ino & LOG_BIT != 0 {
+            return reply.error(Errno::EROFS);
+        }
         let result = self.read_inode(ino).and_then(|mut inode| {
+            if inode.nlink == 0 {
+                return Err(io::Error::from_raw_os_error(Errno::EROFS.code()));
+            }
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -638,8 +733,8 @@ impl Filesystem for Pelican {
         umask: u32,
         reply: fuser::ReplyEntry,
     ) {
-        if name.len() > MAX_NAME {
-            return reply.error(Errno::ENAMETOOLONG);
+        if let Err(e) = check_name(name.as_bytes()) {
+            return reply.error(e);
         }
         let parent = u64::from(parent);
 
@@ -792,9 +887,10 @@ impl Filesystem for Pelican {
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        if newname.len() > MAX_NAME {
-            return reply.error(Errno::ENAMETOOLONG);
+        if let Err(e) = check_name(name.as_bytes()) {
+            return reply.error(e);
         }
+
         let (parent, newparent) = (u64::from(parent), u64::from(newparent));
         let (name, newname) = (name.as_bytes(), newname.as_bytes());
 

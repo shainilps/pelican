@@ -7,12 +7,10 @@ use fuser::{Errno, FileAttr, FileType, INodeNo};
 
 use crate::{inode::INode, superblock::BLOCK_SIZE};
 
-// fuser error code -> io::Error, for helpers that return io::Result
 pub fn errno(e: Errno) -> io::Error {
     io::Error::from_raw_os_error(e.code())
 }
 
-// on-disk inode -> the attributes FUSE reports to the kernel
 pub fn to_attr(ino: u64, inode: &INode) -> FileAttr {
     let kind = if inode.kind & 0o170000 == 0o040000 {
         FileType::Directory
