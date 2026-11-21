@@ -1,16 +1,16 @@
 use std::{
     error::Error,
-    ffi::{FromBytesUntilNulError, OsStr},
+    ffi::OsStr,
     fs::{File, OpenOptions},
     io,
     os::unix::{ffi::OsStrExt, fs::FileExt},
     sync::Mutex,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fuser::{
-    Config, FileAttr,
-    FileType::{self, BlockDevice},
+    Config, Errno, FileAttr,
+    FileType::{self},
     Filesystem, INodeNo, MountOption,
 };
 
@@ -81,6 +81,57 @@ impl Pelican {
         }
 
         Ok(out)
+    }
+
+    fn alloc_block(&self) -> io::Result<u64> {
+        let mut sb = self.sb.lock().unwrap();
+        if sb.free_blocks == 0 {
+            return Err(io::Error::from_raw_os_error(Errno::ENOSPC.code()));
+        }
+
+        let mut bitmap = [0u8; BLOCK_SIZE as usize];
+        let bitmap_off = sb.block_bitmap_at * BLOCK_SIZE;
+        self.file.read_exact_at(&mut bitmap, bitmap_off)?;
+
+        let block = (sb.data_at..sb.total_blocks)
+            .find(|&n| bitmap[(n / 8) as usize] & (1 << (n % 8)) == 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(Errno::ENOSPC.code()))?;
+
+        bitmap[(block / 8) as usize] |= 1 << (block % 8);
+        self.file.write_all_at(&bitmap, bitmap_off)?;
+
+        sb.free_blocks -= 1;
+        self.write_superblock(&sb)?;
+
+        self.file
+            .write_all_at(&[0u8; BLOCK_SIZE as usize], block * BLOCK_SIZE)?;
+        Ok(block)
+    }
+
+    fn write_data(&self, inode: &mut INode, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let end = offset + data.len() as u64;
+        if end > inode.dpointers.len() as u64 * BLOCK_SIZE {
+            return Err(io::Error::from_raw_os_error(Errno::EFBIG.code()));
+        }
+
+        let mut pos = offset;
+        while pos < end {
+            let index = (pos / BLOCK_SIZE) as usize;
+            let in_block = pos % BLOCK_SIZE;
+            let n = (BLOCK_SIZE - in_block).min(end - pos);
+
+            if inode.dpointers[index] == 0 {
+                inode.dpointers[index] = self.alloc_block()?;
+            }
+            let block = inode.dpointers[index];
+
+            let src = &data[(pos - offset) as usize..(pos - offset + n) as usize];
+            self.file.write_all_at(src, block * BLOCK_SIZE + in_block)?;
+            pos += n;
+        }
+
+        inode.size = inode.size.max(end);
+        Ok(data.len())
     }
 }
 
@@ -185,6 +236,37 @@ impl Filesystem for Pelican {
         match result {
             Ok(data) => reply.data(&data),
             Err(_) => reply.error(fuser::Errno::EIO),
+        }
+    }
+
+    fn write(
+        &self,
+        _req: &fuser::Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: fuser::OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: fuser::ReplyWrite,
+    ) {
+        let ino = u64::from(ino);
+        let result = self.read_inode(ino).and_then(|mut inode| {
+            let n = self.write_data(&mut inode, offset, data)?;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            inode.mtime = now;
+            inode.ctime = now;
+            self.write_inode(ino, &inode)?;
+            Ok(n)
+        });
+
+        match result {
+            Ok(n) => reply.written(n as u32),
+            Err(e) => reply.error(fuser::Errno::from_i32(e.raw_os_error().unwrap_or(EIO))),
         }
     }
 }
