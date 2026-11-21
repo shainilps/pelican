@@ -1,3 +1,9 @@
+use chrono::{DateTime, Local};
+use fuser::{
+    Config, Errno, FileAttr,
+    FileType::{self},
+    Filesystem, INodeNo, MountOption, RenameFlags,
+};
 use std::{
     collections::HashSet,
     ffi::OsStr,
@@ -8,17 +14,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use fuser::{
-    Config, Errno, FileAttr,
-    FileType::{self},
-    Filesystem, INodeNo, MountOption, RenameFlags,
-};
-
 mod convert;
 use convert::{errno, to_attr};
 
 use crate::{
-    dirent::{DIRENT_SIZE, DirEntry, check_name},
+    dirent::{DIRENT_SIZE, DirEntry, MAX_NAME, check_name},
     inode::{INODE_SIZE, INode},
     superblock::{BLOCK_SIZE, ROOT_INODE, SuperBlock},
 };
@@ -29,6 +29,7 @@ const LOG_BIT: u64 = 1 << 63;
 struct Pelican {
     file: File,
     sb: Mutex<SuperBlock>,
+    revision_interval: u64,
 }
 
 impl Pelican {
@@ -365,16 +366,26 @@ impl Pelican {
     }
 
     fn revision_log(&self, file_ino: u64) -> io::Result<Vec<u8>> {
-        let mut out = String::new();
+        let mut versions = Vec::new();
         let mut next = file_ino;
-        let mut index = 0;
         while next != 0 {
-            let rev = self.read_inode(next)?;
-            out.push_str(&format!("{index} -> {}\n", rev.mtime));
-            next = rev.revision_head;
-            index += 1
+            let inode = self.read_inode(next)?;
+            versions.push(inode.mtime);
+            next = inode.revision_head;
         }
 
+        let mut out = format!("{} versions\n\n", versions.len());
+        for (i, mtime) in versions.iter().enumerate() {
+            let when = DateTime::from_timestamp(*mtime as i64, 0)
+                .map(|t| {
+                    t.with_timezone(&Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "?".into());
+            let tag = if i == 0 { "   (current)" } else { "" };
+            out.push_str(&format!("  @{i:<3} {when}{tag}\n"));
+        }
         Ok(out.into_bytes())
     }
 
@@ -400,7 +411,6 @@ impl Pelican {
             return Ok(self.log_attr(file.inode)?);
         }
 
-        // N: walk N steps down the revision chain
         let n: u64 = std::str::from_utf8(suffix)
             .ok()
             .and_then(|s| s.parse().ok())
@@ -410,7 +420,7 @@ impl Pelican {
         for _ in 0..n {
             ino = self.read_inode(ino)?.revision_head;
             if ino == 0 {
-                return Err(Errno::ENOENT); // no such revision
+                return Err(Errno::ENOENT);
             }
         }
         Ok(to_attr(ino, &self.read_inode(ino)?))
@@ -418,6 +428,20 @@ impl Pelican {
 }
 
 impl Filesystem for Pelican {
+    fn statfs(&self, _req: &fuser::Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        let sb = self.sb.lock().unwrap();
+        reply.statfs(
+            sb.total_blocks - sb.data_at,
+            sb.free_blocks,
+            sb.free_blocks,
+            sb.inode_count,
+            sb.free_inodes,
+            BLOCK_SIZE as u32,
+            MAX_NAME as u32,
+            BLOCK_SIZE as u32,
+        );
+    }
+
     fn getattr(
         &self,
         _req: &fuser::Request,
@@ -575,7 +599,7 @@ impl Filesystem for Pelican {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            if now.saturating_sub(inode.rtime) > REVISION_INTERVAL {
+            if now.saturating_sub(inode.rtime) > self.revision_interval {
                 self.snapshot(&mut inode, now)?;
             }
 
@@ -700,7 +724,7 @@ impl Filesystem for Pelican {
                 inode.gid = g as u64;
             }
             if let Some(sz) = size {
-                if now.saturating_sub(inode.rtime) > REVISION_INTERVAL {
+                if now.saturating_sub(inode.rtime) > self.revision_interval {
                     self.snapshot(&mut inode, now)?;
                 }
                 self.truncate(&mut inode, sz)?;
@@ -982,6 +1006,16 @@ pub fn mount(image: &str, mountpoint: &str) -> io::Result<()> {
 
     let mut config = Config::default();
     config.mount_options = vec![MountOption::RW, MountOption::FSName("pelican".to_string())];
-    fuser::mount(Pelican { file, sb }, mountpoint, &config)?;
+    let revision_interval = std::env::var("PELICAN_REVISION_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REVISION_INTERVAL);
+
+    let fs = Pelican {
+        file,
+        sb,
+        revision_interval,
+    };
+    fuser::mount(fs, mountpoint, &config)?;
     Ok(())
 }
