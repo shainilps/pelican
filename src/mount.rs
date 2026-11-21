@@ -44,37 +44,16 @@ impl Pelican {
         self.file.write_all_at(&sb.to_bytes(), 0)
     }
 
-    fn read_dir(&self, ino: u64) -> io::Result<Vec<DirEntry>> {
-        let inode = self.read_inode(ino)?;
-        let mut entries = Vec::new();
-        let mut remaining = inode.size;
-
-        for &block in inode.dpointers.iter() {
-            if block == 0 || remaining == 0 {
-                break;
-            }
-
-            let mut buf = [0u8; BLOCK_SIZE as usize];
-            self.file.read_exact_at(&mut buf, block * BLOCK_SIZE)?;
-
-            let used = remaining.min(BLOCK_SIZE);
-
-            for i in 0..(used / DIRENT_SIZE) as usize {
-                let off = i * DIRENT_SIZE as usize;
-                let e = DirEntry::from_bytes(&buf[off..off + DIRENT_SIZE as usize]);
-                if e.inode != 0 {
-                    entries.push(e);
-                }
-            }
-            remaining -= used;
-        }
-
-        Ok(entries)
+    fn read_dir(&self, inode: &INode) -> io::Result<Vec<DirEntry>> {
+        self.read_data(inode, 0, inode.size).map(|data| {
+            data.chunks(DIRENT_SIZE as usize)
+                .map(DirEntry::from_bytes)
+                .filter(|e| e.inode != 0)
+                .collect()
+        })
     }
 
-    fn read(&self, ino: u64, offset: u64, size: u64) -> io::Result<Vec<u8>> {
-        let inode = self.read_inode(ino)?;
-
+    fn read_data(&self, inode: &INode, offset: u64, size: u64) -> io::Result<Vec<u8>> {
         if offset >= inode.size {
             return Ok(Vec::new());
         }
@@ -127,7 +106,10 @@ impl Filesystem for Pelican {
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        let entries = match self.read_dir(u64::from(parent)) {
+        let entries = match self
+            .read_inode(u64::from(parent))
+            .and_then(|inode| self.read_dir(&inode))
+        {
             Ok(e) => e,
             Err(_) => {
                 reply.error(fuser::Errno::EIO);
@@ -159,7 +141,7 @@ impl Filesystem for Pelican {
         mut reply: fuser::ReplyDirectory,
     ) {
         let ino = u64::from(ino);
-        let entries = match self.read_dir(ino) {
+        let entries = match self.read_inode(ino).and_then(|inode| self.read_dir(&inode)) {
             Ok(e) => e,
             Err(_) => {
                 reply.error(fuser::Errno::EIO);
@@ -196,15 +178,14 @@ impl Filesystem for Pelican {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
-        let ino = u64::from(ino);
-        let data = match self.read(ino, offset, size as u64) {
-            Ok(e) => e,
-            Err(_) => {
-                reply.error(fuser::Errno::EIO);
-                return;
-            }
-        };
-        reply.data(&data);
+        let result = self
+            .read_inode(u64::from(ino))
+            .and_then(|inode| self.read_data(&inode, offset, size as u64));
+
+        match result {
+            Ok(data) => reply.data(&data),
+            Err(_) => reply.error(fuser::Errno::EIO),
+        }
     }
 }
 
