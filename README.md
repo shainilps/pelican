@@ -13,14 +13,25 @@ $ cat notes.txt@log
 $ cat notes.txt@2        # how notes.txt looked on 2026-11-20
 ```
 
+## install
+
+Needs Rust and FUSE 3 (`fuse3` package on most distros, provides `fusermount3`).
+
+```bash
+cargo install --path .
+```
+
 ## run
 
 ```bash
 truncate -s 100M disc.img          # 272 KB min, 128 MB max
-cargo run -- mkfs disc.img
-cargo run -- mount disc.img ./tmp
-fusermount3 -u ./tmp               # unmount
+pelican mkfs disc.img
+mkdir -p ./tmp
+pelican mount disc.img ./tmp       # stays in the foreground
+fusermount3 -u ./tmp               # unmount, from another terminal
 ```
+
+`PELICAN_REVISION_INTERVAL` sets the seconds between revisions (default `3600`), and `RUST_LOG=debug` turns on logging, e.g. `PELICAN_REVISION_INTERVAL=5 RUST_LOG=debug pelican mount disc.img ./tmp`.
 
 ## revisions
 
@@ -30,8 +41,6 @@ fusermount3 -u ./tmp               # unmount
 - `@` can't be used in names
 - `rm` deletes the file and its history
 - directories aren't versioned
-
-For testing, set the interval in seconds: `PELICAN_REVISION_INTERVAL=5 cargo run -- mount disc.img ./tmp`
 
 ## disk layout
 
