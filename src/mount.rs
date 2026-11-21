@@ -2,7 +2,10 @@ use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
     io,
-    os::unix::{ffi::OsStrExt, fs::FileExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileExt, MetadataExt},
+    },
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -10,13 +13,13 @@ use std::{
 use fuser::{
     Config, Errno, FileAttr,
     FileType::{self},
-    Filesystem, INodeNo, MountOption,
+    Filesystem, INodeNo, MountOption, RenameFlags,
 };
 
 use crate::{
     dirent::{DIRENT_SIZE, DirEntry, MAX_NAME},
     inode::{INODE_SIZE, INode},
-    superblock::{BLOCK_SIZE, SuperBlock},
+    superblock::{BLOCK_SIZE, ROOT_INODE, SuperBlock},
 };
 
 struct Pelican {
@@ -82,6 +85,32 @@ impl Pelican {
         Ok(out)
     }
 
+    fn write_data(&self, inode: &mut INode, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let end = offset + data.len() as u64;
+        if end > inode.dpointers.len() as u64 * BLOCK_SIZE {
+            return Err(io::Error::from_raw_os_error(Errno::EFBIG.code()));
+        }
+
+        let mut pos = offset;
+        while pos < end {
+            let index = (pos / BLOCK_SIZE) as usize;
+            let in_block = pos % BLOCK_SIZE;
+            let n = (BLOCK_SIZE - in_block).min(end - pos);
+
+            if inode.dpointers[index] == 0 {
+                inode.dpointers[index] = self.alloc_block()?;
+            }
+            let block = inode.dpointers[index];
+
+            let src = &data[(pos - offset) as usize..(pos - offset + n) as usize];
+            self.file.write_all_at(src, block * BLOCK_SIZE + in_block)?;
+            pos += n;
+        }
+
+        inode.size = inode.size.max(end);
+        Ok(data.len())
+    }
+
     fn alloc_block(&self) -> io::Result<u64> {
         let mut sb = self.sb.lock().unwrap();
         if sb.free_blocks == 0 {
@@ -143,33 +172,21 @@ impl Pelican {
         Ok(ino)
     }
 
-    fn write_data(&self, inode: &mut INode, offset: u64, data: &[u8]) -> io::Result<usize> {
-        let end = offset + data.len() as u64;
-        if end > inode.dpointers.len() as u64 * BLOCK_SIZE {
-            return Err(io::Error::from_raw_os_error(Errno::EFBIG.code()));
-        }
+    fn free_inode(&self, ino: u64) -> io::Result<()> {
+        let mut sb = self.sb.lock().unwrap();
 
-        let mut pos = offset;
-        while pos < end {
-            let index = (pos / BLOCK_SIZE) as usize;
-            let in_block = pos % BLOCK_SIZE;
-            let n = (BLOCK_SIZE - in_block).min(end - pos);
+        let mut bitmap = [0u8; BLOCK_SIZE as usize];
+        let bitmap_off = sb.inode_bitmap_at * BLOCK_SIZE;
+        self.file.read_exact_at(&mut bitmap, bitmap_off)?;
 
-            if inode.dpointers[index] == 0 {
-                inode.dpointers[index] = self.alloc_block()?;
-            }
-            let block = inode.dpointers[index];
+        bitmap[(ino / 8) as usize] &= !(1 << (ino % 8));
+        self.file.write_all_at(&bitmap, bitmap_off)?;
 
-            let src = &data[(pos - offset) as usize..(pos - offset + n) as usize];
-            self.file.write_all_at(src, block * BLOCK_SIZE + in_block)?;
-            pos += n;
-        }
-
-        inode.size = inode.size.max(end);
-        Ok(data.len())
+        sb.free_inodes += 1;
+        self.write_superblock(&sb)
     }
 
-    fn add_dir_entry(&self, parent_ino: u64, entry: &DirEntry) -> io::Result<()> {
+    fn add_entry(&self, parent_ino: u64, entry: &DirEntry) -> io::Result<()> {
         let mut parent = self.read_inode(parent_ino)?;
         let data = self.read_data(&parent, 0, parent.size)?;
 
@@ -196,6 +213,30 @@ impl Pelican {
         parent.mtime = now;
         parent.ctime = now;
         self.write_inode(parent_ino, &parent)
+    }
+
+    fn remove_entry(&self, parent_ino: u64, name: &[u8]) -> io::Result<DirEntry> {
+        let mut parent = self.read_inode(parent_ino)?;
+        let data = self.read_data(&parent, 0, parent.size)?;
+
+        let (slot, entry) = data
+            .chunks(DIRENT_SIZE as usize)
+            .map(DirEntry::from_bytes)
+            .enumerate()
+            .find(|(_, e)| e.inode != 0 && e.name == name)
+            .ok_or_else(|| io::Error::from_raw_os_error(Errno::ENOENT.code()))?;
+
+        let empty = [0u8; DIRENT_SIZE as usize];
+        self.write_data(&mut parent, slot as u64 * DIRENT_SIZE, &empty)?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        parent.mtime = now;
+        parent.ctime = now;
+        self.write_inode(parent_ino, &parent)?;
+        Ok(entry)
     }
 
     fn truncate(&self, inode: &mut INode, new_size: u64) -> io::Result<()> {
@@ -225,6 +266,37 @@ impl Pelican {
 
         inode.size = new_size;
         Ok(())
+    }
+
+    fn destroy_inode(&self, ino: u64, inode: &mut INode) -> io::Result<()> {
+        self.truncate(inode, 0)?;
+        self.free_inode(ino)
+    }
+
+    fn find_entry(&self, dir: u64, name: &[u8]) -> io::Result<Option<DirEntry>> {
+        let inode = self.read_inode(dir)?;
+        Ok(self.read_dir(&inode)?.into_iter().find(|e| e.name == name))
+    }
+
+    fn is_ancestor(&self, ino: u64, mut dir: u64) -> io::Result<bool> {
+        loop {
+            if dir == ino {
+                return Ok(true);
+            }
+            if dir == ROOT_INODE {
+                return Ok(false);
+            }
+            dir = self
+                .find_entry(dir, b"..")?
+                .map(|e| e.inode)
+                .unwrap_or(ROOT_INODE);
+        }
+    }
+
+    fn add_nlink(&self, ino: u64, delta: i64) -> io::Result<()> {
+        let mut inode = self.read_inode(ino)?;
+        inode.nlink = (inode.nlink as i64 + delta) as u64;
+        self.write_inode(ino, &inode)
     }
 }
 
@@ -402,7 +474,7 @@ impl Filesystem for Pelican {
                 kind: 1,
                 name: name.as_bytes().to_vec(),
             };
-            self.add_dir_entry(u64::from(parent), &entry)?;
+            self.add_entry(u64::from(parent), &entry)?;
             Ok((ino, inode))
         });
 
@@ -477,6 +549,254 @@ impl Filesystem for Pelican {
 
         match result {
             Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        if name.len() > MAX_NAME {
+            return reply.error(Errno::ENAMETOOLONG);
+        }
+        let parent = u64::from(parent);
+
+        let result = self.alloc_inode().and_then(|ino| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut inode = INode {
+                kind: 0o040000 | (mode & !umask & 0o7777) as u64,
+                uid: req.uid() as u64,
+                gid: req.gid() as u64,
+                size: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                nlink: 2,
+                dpointers: [0; 12],
+                ipointer: 0,
+                revision_head: 0,
+            };
+
+            let dot = DirEntry {
+                inode: ino,
+                kind: 2,
+                name: b".".to_vec(),
+            };
+            let dotdot = DirEntry {
+                inode: parent,
+                kind: 2,
+                name: b"..".to_vec(),
+            };
+            self.write_data(&mut inode, 0, &dot.to_bytes())?;
+            self.write_data(&mut inode, DIRENT_SIZE, &dotdot.to_bytes())?;
+            self.write_inode(ino, &inode)?;
+
+            let entry = DirEntry {
+                inode: ino,
+                kind: 2,
+                name: name.as_bytes().to_vec(),
+            };
+            self.add_entry(parent, &entry)?;
+
+            let mut p = self.read_inode(parent)?;
+            p.nlink += 1;
+            self.write_inode(parent, &p)?;
+
+            Ok((ino, inode))
+        });
+
+        match result {
+            Ok((ino, inode)) => reply.entry(
+                &Duration::from_secs(1),
+                &to_attr(ino, &inode),
+                fuser::Generation(0),
+            ),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn unlink(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let parent = u64::from(parent);
+        let result = self
+            .read_inode(parent)
+            .and_then(|p| self.read_dir(&p))
+            .and_then(|entries| {
+                let entry = entries
+                    .into_iter()
+                    .find(|e| e.name == name.as_bytes())
+                    .ok_or_else(|| io::Error::from_raw_os_error(Errno::ENOENT.code()))?;
+                if entry.kind == 2 {
+                    return Err(io::Error::from_raw_os_error(Errno::EISDIR.code()));
+                }
+
+                self.remove_entry(parent, name.as_bytes())?;
+
+                let mut inode = self.read_inode(entry.inode)?;
+                inode.nlink -= 1;
+                if inode.nlink == 0 {
+                    self.destroy_inode(entry.inode, &mut inode)
+                } else {
+                    inode.ctime = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    self.write_inode(entry.inode, &inode)
+                }
+            });
+
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn rmdir(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let parent = u64::from(parent);
+        let result = self
+            .read_inode(parent)
+            .and_then(|p| self.read_dir(&p))
+            .and_then(|entries| {
+                let entry = entries
+                    .into_iter()
+                    .find(|e| e.name == name.as_bytes())
+                    .ok_or_else(|| io::Error::from_raw_os_error(Errno::ENOENT.code()))?;
+                if entry.kind != 2 {
+                    return Err(io::Error::from_raw_os_error(Errno::ENOTDIR.code()));
+                }
+
+                let mut dir = self.read_inode(entry.inode)?;
+                let children = self.read_dir(&dir)?;
+                if children.iter().any(|c| c.name != b"." && c.name != b"..") {
+                    return Err(io::Error::from_raw_os_error(Errno::ENOTEMPTY.code()));
+                }
+
+                self.remove_entry(parent, name.as_bytes())?;
+                self.destroy_inode(entry.inode, &mut dir)?;
+
+                let mut p = self.read_inode(parent)?;
+                p.nlink -= 1;
+                self.write_inode(parent, &p)
+            });
+
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let err = |e: Errno| io::Error::from_raw_os_error(e.code());
+
+        if newname.len() > MAX_NAME {
+            return reply.error(Errno::ENAMETOOLONG);
+        }
+        let (parent, newparent) = (u64::from(parent), u64::from(newparent));
+        let (name, newname) = (name.as_bytes(), newname.as_bytes());
+
+        let result = (|| -> io::Result<()> {
+            let src = self
+                .find_entry(parent, name)?
+                .ok_or_else(|| err(Errno::ENOENT))?;
+            let src_is_dir = src.kind == 2;
+
+            if src_is_dir && self.is_ancestor(src.inode, newparent)? {
+                return Err(err(Errno::EINVAL));
+            }
+
+            if let Some(dst) = self.find_entry(newparent, newname)? {
+                if dst.inode == src.inode {
+                    return Ok(());
+                }
+                if flags.contains(RenameFlags::RENAME_NOREPLACE) {
+                    return Err(err(Errno::EEXIST));
+                }
+                let dst_is_dir = dst.kind == 2;
+                match (src_is_dir, dst_is_dir) {
+                    (false, true) => return Err(err(Errno::EISDIR)),
+                    (true, false) => return Err(err(Errno::ENOTDIR)),
+                    _ => {}
+                }
+
+                let mut dst_inode = self.read_inode(dst.inode)?;
+                if dst_is_dir {
+                    let children = self.read_dir(&dst_inode)?;
+                    if children.iter().any(|c| c.name != b"." && c.name != b"..") {
+                        return Err(err(Errno::ENOTEMPTY));
+                    }
+                    self.remove_entry(newparent, newname)?;
+                    self.destroy_inode(dst.inode, &mut dst_inode)?;
+                    self.add_nlink(newparent, -1)?;
+                } else {
+                    self.remove_entry(newparent, newname)?;
+                    dst_inode.nlink -= 1;
+                    if dst_inode.nlink == 0 {
+                        self.destroy_inode(dst.inode, &mut dst_inode)?;
+                    } else {
+                        self.write_inode(dst.inode, &dst_inode)?;
+                    }
+                }
+            }
+
+            self.remove_entry(parent, name)?;
+            let moved = DirEntry {
+                inode: src.inode,
+                kind: src.kind,
+                name: newname.to_vec(),
+            };
+            self.add_entry(newparent, &moved)?;
+
+            if src_is_dir && parent != newparent {
+                self.remove_entry(src.inode, b"..")?;
+                let dotdot = DirEntry {
+                    inode: newparent,
+                    kind: 2,
+                    name: b"..".to_vec(),
+                };
+                self.add_entry(src.inode, &dotdot)?;
+                self.add_nlink(parent, -1)?;
+                self.add_nlink(newparent, 1)?;
+            }
+
+            let mut inode = self.read_inode(src.inode)?;
+            inode.ctime = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.write_inode(src.inode, &inode)
+        })();
+
+        match result {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
     }
