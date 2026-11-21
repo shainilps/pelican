@@ -1,4 +1,4 @@
-use std::error::Error;
+use std::io;
 
 use crate::util;
 
@@ -36,9 +36,12 @@ impl SuperBlock {
         buf
     }
 
-    pub fn from_bytes(buf: &[u8]) -> Result<SuperBlock, Box<dyn Error>> {
+    pub fn from_bytes(buf: &[u8]) -> io::Result<SuperBlock> {
         if &buf[0..8] != MAGIC {
-            return Err("not a pelican image (bad magic)".into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a pelican image (bad magic)",
+            ));
         }
 
         Ok(SuperBlock {

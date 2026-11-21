@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     ffi::OsStr,
     fs::{File, OpenOptions},
     io,
@@ -266,7 +265,7 @@ impl Filesystem for Pelican {
 
         match result {
             Ok(n) => reply.written(n as u32),
-            Err(e) => reply.error(fuser::Errno::from_i32(e.raw_os_error().unwrap_or(EIO))),
+            Err(e) => reply.error(e.into()),
         }
     }
 }
@@ -298,7 +297,7 @@ fn to_attr(ino: u64, inode: &INode) -> FileAttr {
     }
 }
 
-pub fn mount(image: &str, mountpoint: &str) -> Result<(), Box<dyn Error>> {
+pub fn mount(image: &str, mountpoint: &str) -> io::Result<()> {
     let file = OpenOptions::new().read(true).write(true).open(image)?;
 
     let mut buf = [0u8; BLOCK_SIZE as usize];

@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fs::OpenOptions,
     io::{self, Seek},
     os::unix::fs::{FileExt, MetadataExt},
@@ -16,16 +15,22 @@ use crate::{
 };
 
 //max 128mb supported for now
-pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
+pub fn mkfs(image: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().read(true).write(true).open(image)?;
     let size = file.seek(io::SeekFrom::End(0))?;
     let total_blocks = size / BLOCK_SIZE;
 
     if total_blocks < 68 {
-        return Err(format!("image too small: {total_blocks} blocks, need at least 68").into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("image too small: {total_blocks} blocks, need at least 68"),
+        ));
     }
     if total_blocks > 32768 {
-        return Err(format!("image too big: {total_blocks} blocks, max 32768 (128 MB)").into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("image too big: {total_blocks} blocks, max 32768 (128 MB)"),
+        ));
     }
 
     let total_inode: u64 = 1024;
@@ -57,7 +62,10 @@ pub fn mkfs(image: &str) -> Result<(), Box<dyn Error>> {
     let mut inode_bitmap = [0u8; BLOCK_SIZE as usize];
     inode_bitmap[0] = 0b11;
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_secs();
     let meta = file.metadata()?;
 
     let mut root = INode {
