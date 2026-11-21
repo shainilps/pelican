@@ -81,3 +81,5 @@ A revision is a copy of the inode (same block pointers) linked through `revision
 ## todo
 
 - make it a distributed filesystem
+- journaling, so a crash mid-write can't leave the disk half-updated
+- use the indirect pointer, for files bigger than 48 KB
