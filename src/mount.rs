@@ -14,7 +14,7 @@ use fuser::{
 };
 
 use crate::{
-    dirent::{DIRENT_SIZE, DirEntry},
+    dirent::{DIRENT_SIZE, DirEntry, MAX_NAME},
     inode::{INODE_SIZE, INode},
     superblock::{BLOCK_SIZE, SuperBlock},
 };
@@ -107,6 +107,42 @@ impl Pelican {
         Ok(block)
     }
 
+    fn free_block(&self, block: u64) -> io::Result<()> {
+        let mut sb = self.sb.lock().unwrap();
+
+        let mut bitmap = [0u8; BLOCK_SIZE as usize];
+        let bitmap_off = sb.block_bitmap_at * BLOCK_SIZE;
+        self.file.read_exact_at(&mut bitmap, bitmap_off)?;
+
+        bitmap[(block / 8) as usize] &= !(1 << (block % 8));
+        self.file.write_all_at(&bitmap, bitmap_off)?;
+
+        sb.free_blocks += 1;
+        self.write_superblock(&sb)
+    }
+
+    fn alloc_inode(&self) -> io::Result<u64> {
+        let mut sb = self.sb.lock().unwrap();
+        if sb.free_inodes == 0 {
+            return Err(io::Error::from_raw_os_error(Errno::ENOSPC.code()));
+        }
+
+        let mut bitmap = [0u8; BLOCK_SIZE as usize];
+        let bitmap_off = sb.inode_bitmap_at * BLOCK_SIZE;
+        self.file.read_exact_at(&mut bitmap, bitmap_off)?;
+
+        let ino = (1..sb.inode_count)
+            .find(|&n| bitmap[(n / 8) as usize] & (1 << (n % 8)) == 0)
+            .ok_or_else(|| io::Error::from_raw_os_error(Errno::ENOSPC.code()))?;
+
+        bitmap[(ino / 8) as usize] |= 1 << (ino % 8);
+        self.file.write_all_at(&bitmap, bitmap_off)?;
+
+        sb.free_inodes -= 1;
+        self.write_superblock(&sb)?;
+        Ok(ino)
+    }
+
     fn write_data(&self, inode: &mut INode, offset: u64, data: &[u8]) -> io::Result<usize> {
         let end = offset + data.len() as u64;
         if end > inode.dpointers.len() as u64 * BLOCK_SIZE {
@@ -131,6 +167,64 @@ impl Pelican {
 
         inode.size = inode.size.max(end);
         Ok(data.len())
+    }
+
+    fn add_dir_entry(&self, parent_ino: u64, entry: &DirEntry) -> io::Result<()> {
+        let mut parent = self.read_inode(parent_ino)?;
+        let data = self.read_data(&parent, 0, parent.size)?;
+
+        let mut free_slot = None;
+        for (i, chunk) in data.chunks(DIRENT_SIZE as usize).enumerate() {
+            let e = DirEntry::from_bytes(chunk);
+            if e.inode == 0 {
+                free_slot.get_or_insert(i);
+            } else if e.name == entry.name {
+                return Err(io::Error::from_raw_os_error(Errno::EEXIST.code()));
+            }
+        }
+
+        let offset = match free_slot {
+            Some(i) => i as u64 * DIRENT_SIZE,
+            None => parent.size,
+        };
+        self.write_data(&mut parent, offset, &entry.to_bytes())?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        parent.mtime = now;
+        parent.ctime = now;
+        self.write_inode(parent_ino, &parent)
+    }
+
+    fn truncate(&self, inode: &mut INode, new_size: u64) -> io::Result<()> {
+        if new_size > inode.dpointers.len() as u64 * BLOCK_SIZE {
+            return Err(io::Error::from_raw_os_error(Errno::EFBIG.code()));
+        }
+
+        if new_size < inode.size {
+            let keep = new_size.div_ceil(BLOCK_SIZE) as usize;
+            for slot in inode.dpointers.iter_mut().skip(keep) {
+                if *slot != 0 {
+                    self.free_block(*slot)?;
+                    *slot = 0;
+                }
+            }
+
+            let in_block = new_size % BLOCK_SIZE;
+            if in_block != 0 {
+                let block = inode.dpointers[keep - 1];
+                if block != 0 {
+                    let tail = vec![0u8; (BLOCK_SIZE - in_block) as usize];
+                    self.file
+                        .write_all_at(&tail, block * BLOCK_SIZE + in_block)?;
+                }
+            }
+        }
+
+        inode.size = new_size;
+        Ok(())
     }
 }
 
@@ -265,6 +359,124 @@ impl Filesystem for Pelican {
 
         match result {
             Ok(n) => reply.written(n as u32),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn create(
+        &self,
+        req: &fuser::Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        if name.len() > MAX_NAME {
+            return reply.error(Errno::ENAMETOOLONG);
+        }
+
+        let result = self.alloc_inode().and_then(|ino| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let inode = INode {
+                kind: 0o100000 | (mode & !umask & 0o7777) as u64,
+                uid: req.uid() as u64,
+                gid: req.gid() as u64,
+                size: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                nlink: 1,
+                dpointers: [0; 12],
+                ipointer: 0,
+                revision_head: 0,
+            };
+            self.write_inode(ino, &inode)?;
+
+            let entry = DirEntry {
+                inode: ino,
+                kind: 1,
+                name: name.as_bytes().to_vec(),
+            };
+            self.add_dir_entry(u64::from(parent), &entry)?;
+            Ok((ino, inode))
+        });
+
+        match result {
+            Ok((ino, inode)) => reply.created(
+                &Duration::from_secs(1),
+                &to_attr(ino, &inode),
+                fuser::Generation(0),
+                fuser::FileHandle(0),
+                fuser::FopenFlags::empty(),
+            ),
+            Err(e) => reply.error(e.into()),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &fuser::Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<fuser::FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: fuser::ReplyAttr,
+    ) {
+        let ino = u64::from(ino);
+        let result = self.read_inode(ino).and_then(|mut inode| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let secs = |t: fuser::TimeOrNow| match t {
+                fuser::TimeOrNow::Now => now,
+                fuser::TimeOrNow::SpecificTime(st) => st
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            };
+
+            if let Some(m) = mode {
+                inode.kind = (inode.kind & 0o170000) | (m as u64 & 0o7777);
+            }
+            if let Some(u) = uid {
+                inode.uid = u as u64;
+            }
+            if let Some(g) = gid {
+                inode.gid = g as u64;
+            }
+            if let Some(sz) = size {
+                self.truncate(&mut inode, sz)?;
+                inode.mtime = now;
+            }
+            if let Some(t) = atime {
+                inode.atime = secs(t);
+            }
+            if let Some(t) = mtime {
+                inode.mtime = secs(t);
+            }
+            inode.ctime = now;
+
+            self.write_inode(ino, &inode)?;
+            Ok(to_attr(ino, &inode))
+        });
+
+        match result {
+            Ok(attr) => reply.attr(&Duration::from_secs(1), &attr),
             Err(e) => reply.error(e.into()),
         }
     }
