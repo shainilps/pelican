@@ -2,19 +2,19 @@ use std::{
     ffi::OsStr,
     fs::{File, OpenOptions},
     io,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileExt, MetadataExt},
-    },
+    os::unix::{ffi::OsStrExt, fs::FileExt},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fuser::{
-    Config, Errno, FileAttr,
+    Config, Errno,
     FileType::{self},
     Filesystem, INodeNo, MountOption, RenameFlags,
 };
+
+mod convert;
+use convert::{errno, to_attr};
 
 use crate::{
     dirent::{DIRENT_SIZE, DirEntry, MAX_NAME},
@@ -715,7 +715,6 @@ impl Filesystem for Pelican {
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
-        let err = |e: Errno| io::Error::from_raw_os_error(e.code());
 
         if newname.len() > MAX_NAME {
             return reply.error(Errno::ENAMETOOLONG);
@@ -726,11 +725,11 @@ impl Filesystem for Pelican {
         let result = (|| -> io::Result<()> {
             let src = self
                 .find_entry(parent, name)?
-                .ok_or_else(|| err(Errno::ENOENT))?;
+                .ok_or_else(|| errno(Errno::ENOENT))?;
             let src_is_dir = src.kind == 2;
 
             if src_is_dir && self.is_ancestor(src.inode, newparent)? {
-                return Err(err(Errno::EINVAL));
+                return Err(errno(Errno::EINVAL));
             }
 
             if let Some(dst) = self.find_entry(newparent, newname)? {
@@ -738,12 +737,12 @@ impl Filesystem for Pelican {
                     return Ok(());
                 }
                 if flags.contains(RenameFlags::RENAME_NOREPLACE) {
-                    return Err(err(Errno::EEXIST));
+                    return Err(errno(Errno::EEXIST));
                 }
                 let dst_is_dir = dst.kind == 2;
                 match (src_is_dir, dst_is_dir) {
-                    (false, true) => return Err(err(Errno::EISDIR)),
-                    (true, false) => return Err(err(Errno::ENOTDIR)),
+                    (false, true) => return Err(errno(Errno::EISDIR)),
+                    (true, false) => return Err(errno(Errno::ENOTDIR)),
                     _ => {}
                 }
 
@@ -751,7 +750,7 @@ impl Filesystem for Pelican {
                 if dst_is_dir {
                     let children = self.read_dir(&dst_inode)?;
                     if children.iter().any(|c| c.name != b"." && c.name != b"..") {
-                        return Err(err(Errno::ENOTEMPTY));
+                        return Err(errno(Errno::ENOTEMPTY));
                     }
                     self.remove_entry(newparent, newname)?;
                     self.destroy_inode(dst.inode, &mut dst_inode)?;
@@ -799,33 +798,6 @@ impl Filesystem for Pelican {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
-    }
-}
-
-fn to_attr(ino: u64, inode: &INode) -> FileAttr {
-    let kind = if inode.kind & 0o170000 == 0o040000 {
-        FileType::Directory
-    } else {
-        FileType::RegularFile
-    };
-    let time = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
-
-    FileAttr {
-        ino: INodeNo(ino),
-        size: inode.size,
-        blocks: (inode.size + 511) / 512,
-        atime: time(inode.atime),
-        mtime: time(inode.mtime),
-        ctime: time(inode.ctime),
-        crtime: time(inode.ctime),
-        kind,
-        perm: (inode.kind & 0o7777) as u16,
-        nlink: inode.nlink as u32,
-        uid: inode.uid as u32,
-        gid: inode.gid as u32,
-        rdev: 0,
-        blksize: BLOCK_SIZE as u32,
-        flags: 0,
     }
 }
 
